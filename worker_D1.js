@@ -1,15 +1,27 @@
-// === 配置变量 ===
-const TOKEN = ENV_BOT_TOKEN // 从 @BotFather 获取
-const WEBHOOK = '/endpoint'
-const SECRET = ENV_BOT_SECRET // A-Z, a-z, 0-9, _ and -
-const ADMIN_UID = ENV_ADMIN_UID // 管理员用户 ID
-const ADMIN_GROUP_ID = ENV_ADMIN_GROUP_ID // 管理群组 ID (必须是开启话题的超级群组)
-// === 选填变量 ===
-const WELCOME_MESSAGE = (typeof ENV_WELCOME_MESSAGE !== 'undefined') ? ENV_WELCOME_MESSAGE : '欢迎使用机器人' // 欢迎消息
-const MESSAGE_INTERVAL = (typeof ENV_MESSAGE_INTERVAL !== 'undefined') ? parseInt(ENV_MESSAGE_INTERVAL) || 1 : 1 // 消息间隔限制（秒）
-const DELETE_TOPIC_AS_BAN = (typeof ENV_DELETE_TOPIC_AS_BAN !== 'undefined') ? ENV_DELETE_TOPIC_AS_BAN === 'true' : false // 删除话题是否等同于永久封禁
-const ENABLE_VERIFICATION = (typeof ENV_ENABLE_VERIFICATION !== 'undefined') ? ENV_ENABLE_VERIFICATION === 'true' : false // 是否启用验证码验证（默认关闭）
-const VERIFICATION_MAX_ATTEMPTS = (typeof ENV_VERIFICATION_MAX_ATTEMPTS !== 'undefined') ? parseInt(ENV_VERIFICATION_MAX_ATTEMPTS) || 10 : 10 // 验证码最大尝试次数（默认10次）
+// === 配置变量（从 env 中获取）===
+let TOKEN = null
+let WEBHOOK = '/endpoint'
+let SECRET = null
+let ADMIN_UID = null
+let ADMIN_GROUP_ID = null
+let WELCOME_MESSAGE = '欢迎使用机器人'
+let MESSAGE_INTERVAL = 1
+let DELETE_TOPIC_AS_BAN = false
+let ENABLE_VERIFICATION = false
+let VERIFICATION_MAX_ATTEMPTS = 10
+
+// 初始化配置变量
+function initConfig(env) {
+  TOKEN = env.ENV_BOT_TOKEN
+  SECRET = env.ENV_BOT_SECRET
+  ADMIN_UID = env.ENV_ADMIN_UID
+  ADMIN_GROUP_ID = env.ENV_ADMIN_GROUP_ID
+  WELCOME_MESSAGE = env.ENV_WELCOME_MESSAGE || '欢迎使用机器人'
+  MESSAGE_INTERVAL = env.ENV_MESSAGE_INTERVAL ? parseInt(env.ENV_MESSAGE_INTERVAL) || 1 : 1
+  DELETE_TOPIC_AS_BAN = (env.ENV_DELETE_TOPIC_AS_BAN || '').toLowerCase() === 'true'
+  ENABLE_VERIFICATION = (env.ENV_ENABLE_VERIFICATION || '').toLowerCase() === 'true'
+  VERIFICATION_MAX_ATTEMPTS = env.ENV_VERIFICATION_MAX_ATTEMPTS ? parseInt(env.ENV_VERIFICATION_MAX_ATTEMPTS) || 10 : 10
+}
 
 /**
  * Telegram API 请求封装
@@ -162,81 +174,164 @@ class VerificationCache {
 }
 
 /**
- * 数据库操作封装 (使用 KV 存储)
+ * 数据库操作封装 (使用 D1 数据库)
  */
 class Database {
+  constructor(d1) {
+    this.d1 = d1
+  }
+
   // 用户相关
   async getUser(user_id) {
-    const user = await horr.get(`user:${user_id}`, { type: 'json' })
-    return user
+    const result = await this.d1.prepare(
+      'SELECT * FROM users WHERE user_id = ?'
+    ).bind(user_id.toString()).first()
+    
+    if (!result) return null
+    
+    return {
+      user_id: result.user_id,
+      first_name: result.first_name,
+      last_name: result.last_name,
+      username: result.username,
+      message_thread_id: result.message_thread_id,
+      created_at: result.created_at,
+      updated_at: result.updated_at
+    }
   }
 
   async setUser(user_id, userData) {
-    await horr.put(`user:${user_id}`, JSON.stringify(userData))
+    await this.d1.prepare(
+      `INSERT OR REPLACE INTO users 
+       (user_id, first_name, last_name, username, message_thread_id, created_at, updated_at) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      user_id.toString(),
+      userData.first_name || null,
+      userData.last_name || null,
+      userData.username || null,
+      userData.message_thread_id || null,
+      userData.created_at || Date.now(),
+      userData.updated_at || Date.now()
+    ).run()
   }
 
   async getAllUsers() {
-    const list = await horr.list({ prefix: 'user:' })
-    const users = []
-    for (const key of list.keys) {
-      const user = await horr.get(key.name, { type: 'json' })
-      if (user) users.push(user)
-    }
-    return users
+    const result = await this.d1.prepare(
+      'SELECT * FROM users'
+    ).all()
+    return result.results || []
   }
 
   // 消息映射相关
   async getMessageMap(key) {
-    return await horr.get(`msgmap:${key}`, { type: 'json' })
+    const result = await this.d1.prepare(
+      'SELECT mapped_value FROM message_mappings WHERE mapping_key = ?'
+    ).bind(key).first()
+    return result?.mapped_value || null
   }
 
   async setMessageMap(key, value) {
-    await horr.put(`msgmap:${key}`, JSON.stringify(value))
+    await this.d1.prepare(
+      'INSERT OR REPLACE INTO message_mappings (mapping_key, mapped_value, created_at) VALUES (?, ?, ?)'
+    ).bind(key, value || null, Date.now()).run()
   }
 
   // 话题状态相关
   async getTopicStatus(thread_id) {
-    return await horr.get(`topic:${thread_id}`, { type: 'json' }) || { status: 'opened' }
+    const result = await this.d1.prepare(
+      'SELECT status, updated_at FROM topic_status WHERE thread_id = ?'
+    ).bind(thread_id).first()
+    return result || { status: 'opened' }
   }
 
   async setTopicStatus(thread_id, status) {
-    await horr.put(`topic:${thread_id}`, JSON.stringify({ status, updated_at: Date.now() }))
+    await this.d1.prepare(
+      'INSERT OR REPLACE INTO topic_status (thread_id, status, updated_at) VALUES (?, ?, ?)'
+    ).bind(thread_id || null, status || 'opened', Date.now()).run()
   }
 
   // 用户状态相关（非验证码）
   async getUserState(user_id, key) {
-    return await horr.get(`state:${user_id}:${key}`, { type: 'json' })
+    const result = await this.d1.prepare(
+      'SELECT state_value, expiry_time FROM user_states WHERE user_id = ? AND state_key = ?'
+    ).bind(user_id.toString(), key).first()
+    
+    if (!result) return null
+    
+    // 检查是否过期
+    if (result.expiry_time && Date.now() > result.expiry_time) {
+      await this.deleteUserState(user_id, key)
+      return null
+    }
+    
+    return JSON.parse(result.state_value)
   }
 
   async setUserState(user_id, key, value, expirationTtl = null) {
-    const options = expirationTtl ? { expirationTtl } : {}
-    await horr.put(`state:${user_id}:${key}`, JSON.stringify(value), options)
+    const expiryTime = expirationTtl ? Date.now() + (expirationTtl * 1000) : null
+    await this.d1.prepare(
+      'INSERT OR REPLACE INTO user_states (user_id, state_key, state_value, expiry_time) VALUES (?, ?, ?, ?)'
+    ).bind(user_id.toString(), key || 'unknown', JSON.stringify(value), expiryTime).run()
   }
 
   async deleteUserState(user_id, key) {
-    await horr.delete(`state:${user_id}:${key}`)
+    await this.d1.prepare(
+      'DELETE FROM user_states WHERE user_id = ? AND state_key = ?'
+    ).bind(user_id.toString(), key).run()
   }
 
   // 屏蔽用户相关
   async isUserBlocked(user_id) {
-    return await horr.get(`blocked:${user_id}`, { type: 'json' }) || false
+    const result = await this.d1.prepare(
+      'SELECT blocked FROM blocked_users WHERE user_id = ?'
+    ).bind(user_id.toString()).first()
+    return result?.blocked === 1 || false
   }
 
   async blockUser(user_id, blocked = true) {
-    await horr.put(`blocked:${user_id}`, JSON.stringify(blocked))
+    if (blocked) {
+      await this.d1.prepare(
+        'INSERT OR REPLACE INTO blocked_users (user_id, blocked, blocked_at) VALUES (?, ?, ?)'
+      ).bind(user_id.toString(), 1, Date.now()).run()
+    } else {
+      await this.d1.prepare(
+        'DELETE FROM blocked_users WHERE user_id = ?'
+      ).bind(user_id.toString()).run()
+    }
   }
 
   // 消息频率限制
   async getLastMessageTime(user_id) {
-    return await horr.get(`lastmsg:${user_id}`, { type: 'json' }) || 0
+    const result = await this.d1.prepare(
+      'SELECT last_message_time FROM message_rates WHERE user_id = ?'
+    ).bind(user_id.toString()).first()
+    return result?.last_message_time || 0
   }
 
   async setLastMessageTime(user_id, timestamp) {
-    await horr.put(`lastmsg:${user_id}`, JSON.stringify(timestamp))
+    await this.d1.prepare(
+      'INSERT OR REPLACE INTO message_rates (user_id, last_message_time) VALUES (?, ?)'
+    ).bind(user_id.toString(), timestamp || Date.now()).run()
+  }
+
+  // 清理过期数据（定期调用）
+  async cleanupExpiredStates() {
+    const now = Date.now()
+    await this.d1.prepare(
+      'DELETE FROM user_states WHERE expiry_time IS NOT NULL AND expiry_time < ?'
+    ).bind(now).run()
+  }
+
+  // 删除用户的所有消息映射
+  async deleteUserMessageMappings(user_id) {
+    await this.d1.prepare(
+      'DELETE FROM message_mappings WHERE mapping_key LIKE ?'
+    ).bind(`u2a:${user_id}:%`).run()
   }
 }
 
-const db = new Database()
+let db = null
 const verificationCache = new VerificationCache()
 
 /**
@@ -268,7 +363,7 @@ function delay(ms) {
 }
 
 /**
- * 发送“已送达”提示（每日一次）并在3秒后撤回
+ * 发送"已送达"提示（每日一次）并在3秒后撤回
  */
 async function maybeSendDeliveredNotice(sender_user_id, target_chat_id, options = {}) {
   const { message_thread_id = null, reply_to_message_id = null, text = '您的消息已送达\nYour message has been delivered' } = options
@@ -329,17 +424,6 @@ async function updateUserDb(user) {
     }
   } catch (error) {
     console.error('Error updating user database:', error)
-    
-    // 检查是否是 KV 写入限制错误
-    if (isKVWriteLimitError(error)) {
-      // 获取用户现有数据以确定是否已有话题
-      const user_data = await db.getUser(user.id).catch(() => null)
-      const message_thread_id = user_data?.message_thread_id || null
-      
-      await handleKVLimitError(user, message_thread_id)
-    }
-    
-    // 重新抛出错误以便上层处理
     throw error
   }
 }
@@ -363,7 +447,7 @@ async function sendContactCard(chat_id, message_thread_id, user) {
         chat_id: chat_id,
         message_thread_id: message_thread_id,
         photo: pic,
-        caption: `👤 ${user.first_name || user.id}\n👤 ${user.first_name || user.id}\n\n📱 ${user.id}\n📱 ${user.id}\n\n🔗 ${user.username ? `直接联系: @${user.username}\nDirect contact: @${user.username}` : `直接联系: tg://user?id=${user.id}\nDirect contact: tg://user?id=${user.id}`}`,
+        caption: `👤 ${user.first_name || user.id}\n\n📱 ${user.id}\n\n🔗 ${user.username ? `直接联系: @${user.username}` : `直接联系: tg://user?id=${user.id}`}`,
         parse_mode: 'HTML'
       }
         
@@ -382,7 +466,7 @@ async function sendContactCard(chat_id, message_thread_id, user) {
       const messageParams = {
         chat_id: chat_id,
         message_thread_id: message_thread_id,
-        text: `👤 ${user.first_name || user.id}\n👤 ${user.first_name || user.id}\n\n📱 ${user.id}\n📱 ${user.id}\n\n🔗 ${user.username ? `直接联系: @${user.username}\nDirect contact: @${user.username}` : `直接联系: tg://user?id=${user.id}\nDirect contact: tg://user?id=${user.id}`}`,
+        text: `👤 ${user.first_name || user.id}\n\n📱 ${user.id}\n\n🔗 ${user.username ? `直接联系: @${user.username}` : `直接联系: tg://user?id=${user.id}`}`,
         parse_mode: 'HTML'
       }
         
@@ -450,94 +534,6 @@ async function handleStart(message) {
       text: `${mentionHtml(user_id, user.first_name || user_id)}：\n\n${WELCOME_MESSAGE}`,
       parse_mode: 'HTML'
     })
-  }
-}
-
-/**
- * 检查是否是 KV 写入限制错误
- */
-function isKVWriteLimitError(error) {
-  const errorMessage = (error.message || '').toLowerCase()
-  return errorMessage.includes('kv put() limit exceeded') || 
-         errorMessage.includes('kv write limit') ||
-         errorMessage.includes('quota exceeded')
-}
-
-// 用于跟踪每日已发送KV限制警告的用户（使用内存变量）
-let dailyKVAlertSent = new Set()
-let lastAlertDate = new Date().toDateString() // 记录上次警告的日期
-
-/**
- * 处理 KV 写入限制错误
- */
-async function handleKVLimitError(user, message_thread_id) {
-  const user_id = user.id
-  const userDisplayName = user.first_name || '用户'
-  const currentDate = new Date().toDateString()
-  
-  try {
-    // 检查是否是新的一天，如果是则清空警告记录
-    if (currentDate !== lastAlertDate) {
-      dailyKVAlertSent.clear()
-      lastAlertDate = currentDate
-      console.log(`🔄 Reset daily KV alert tracking for new date: ${currentDate}`)
-    }
-    
-    // 检查是否已经为该用户发送过警告
-    const alertKey = `${user_id}_${currentDate}`
-    if (!dailyKVAlertSent.has(alertKey)) {
-      // 还没有为该用户发送过警告，发送给管理员
-      let alertText = `🚨 <b>KV 存储限制警告</b>\n\n` +
-                     `⚠️ 已达到 Cloudflare KV 每日写入上限！\n\n` +
-                     `👤 用户信息：\n` +
-                     `• 姓名：${userDisplayName}\n` +
-                     `• 用户名：@${user.username || '无'}\n` +
-                     `• Telegram ID：<code>${user_id}</code>\n` +
-                      (user.username ? '' : `• 直接联系： tg://user?id=${user_id}\n`)  
-      
-      if (message_thread_id) {
-        alertText += `• 话题ID：${message_thread_id}\n`
-        alertText += `• 状态：已有话题，消息无法转发\n\n`
-      } else {
-        alertText += `• 状态：未创建话题，无法创建新话题\n\n`
-      }
-      
-      alertText += `📋 <b>影响：</b>\n` +
-                  `• 无法创建新话题\n` +
-                  `• 无法更新用户数据\n` +
-                  `• 无法转发用户消息\n\n` +
-                  `🔧 <b>建议：</b>\n` +
-                  `• 等待 UTC 时间重置（通常为每日 00:00）\n` +
-                  `• 考虑升级 Cloudflare 计划\n` +
-                  `• 检查是否有异常的写入操作\n\n` +
-                  `⏰ 时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n` +
-                  `ℹ️ 注意：同一用户每日仅提醒一次`
-      
-      await sendMessage({
-        chat_id: ADMIN_UID,
-        text: alertText,
-        parse_mode: 'HTML'
-      })
-      
-      // 记录已发送警告
-      dailyKVAlertSent.add(alertKey)
-      console.log(`✅ KV limit alert sent to admin for user ${user_id}`)
-    } else {
-      console.log(`⏭️ KV limit alert already sent for user ${user_id} today, skipping admin notification`)
-    }
-    
-    // 总是通知用户（不管是否已经通知过管理员）
-    await sendMessage({
-      chat_id: user_id,
-      text: `抱歉，由于系统存储限制，您的消息暂时无法送达。\nSorry, due to system storage limitations, your message cannot be delivered temporarily.\n\n` +
-            `对方已收到通知，请明日重试或等待问题解决。\nHe has been notified, please try again tomorrow or wait for the issue to be resolved.\n\n` +
-            `如有紧急情况，请直接联系对方。\nIf there is an emergency, please contact him directly.`
-    })
-    
-    console.log(`✅ KV limit error handled for user ${user_id}, topic: ${message_thread_id || 'none'}`)
-    
-  } catch (alertError) {
-    console.error('❌ Failed to handle KV limit error:', alertError)
   }
 }
 
@@ -722,7 +718,7 @@ async function forwardMessageU2A(message) {
     // 5. 获取或创建话题
     let user_data = await db.getUser(user_id)
     if (!user_data) {
-      // 如果用户数据不存在（可能是KV延迟），等待并重试一次
+      // 如果用户数据不存在（可能是延迟），等待并重试一次
       console.log(`User data not found for ${user_id}, retrying...`)
       await delay(100) // 等待100ms
       user_data = await db.getUser(user_id)
@@ -875,7 +871,7 @@ async function forwardMessageU2A(message) {
         console.log(`✅ Forwarded u2a: user(${user_id}) msg(${message.message_id}) -> group msg(${sent.result.message_id})`)
         console.log(`✅ Stored mapping: u2a:${message.message_id} -> ${sent.result.message_id}`)
         console.log(`✅ Stored mapping: a2u:${sent.result.message_id} -> ${message.message_id}`)
-        // 发送“已送达”提示（每日一次），3秒后撤回
+        // 发送"已送达"提示（每日一次），3秒后撤回
         await maybeSendDeliveredNotice(user_id, chat_id, { reply_to_message_id: message.message_id })
       } else {
         console.error(`❌ copyMessage failed, sent.ok = false`)
@@ -954,15 +950,6 @@ async function forwardMessageU2A(message) {
     
   } catch (error) {
     console.error('❌ Error in forwardMessageU2A:', error)
-    
-    // 检查是否是 KV 写入限制错误
-    if (isKVWriteLimitError(error)) {
-      const user_data = await db.getUser(user_id).catch(() => null)
-      const message_thread_id = user_data?.message_thread_id || null
-      
-      await handleKVLimitError(user, message_thread_id)
-      return
-    }
     
     // 其他错误的通用处理
     await sendMessage({
@@ -1139,7 +1126,6 @@ async function handleClearCommand(message) {
       chat_id: message.chat.id,
       message_thread_id: message_thread_id,
       text: '你没有权限执行此操作。',
-      // You don't have permission to perform this operation.
       reply_to_message_id: message.message_id
     })
     return
@@ -1149,7 +1135,6 @@ async function handleClearCommand(message) {
     await sendMessage({
       chat_id: message.chat.id,
       text: '请在需要清除的用户对话（话题）中执行此命令。',
-      // Please execute this command in the user conversation (topic) that needs to be cleared.
       reply_to_message_id: message.message_id
     })
     return
@@ -1168,11 +1153,8 @@ async function handleClearCommand(message) {
       target_user.message_thread_id = null
       await db.setUser(target_user.user_id, target_user)
       
-      // 清理消息映射记录
-      const list = await horr.list({ prefix: 'msgmap:u2a:' })
-      for (const key of list.keys) {
-        await horr.delete(key.name)
-      }
+      // D1版本：删除消息映射记录
+      await db.deleteUserMessageMappings(target_user.user_id)
     }
     
     await db.setTopicStatus(message_thread_id, 'deleted')
@@ -1551,18 +1533,99 @@ async function unRegisterWebhook(event) {
 }
 
 /**
- * 主事件监听器
+ * 初始化数据库表
  */
-addEventListener('fetch', event => {
-  const url = new URL(event.request.url)
+async function initDatabase(d1) {
+  const statements = [
+    // 创建表
+    `CREATE TABLE IF NOT EXISTS users (
+      user_id TEXT PRIMARY KEY,
+      first_name TEXT,
+      last_name TEXT,
+      username TEXT,
+      message_thread_id INTEGER,
+      created_at INTEGER,
+      updated_at INTEGER
+    )`,
+    `CREATE TABLE IF NOT EXISTS message_mappings (
+      mapping_key TEXT PRIMARY KEY,
+      mapped_value INTEGER,
+      created_at INTEGER
+    )`,
+    `CREATE TABLE IF NOT EXISTS topic_status (
+      thread_id INTEGER PRIMARY KEY,
+      status TEXT DEFAULT 'opened',
+      updated_at INTEGER
+    )`,
+    `CREATE TABLE IF NOT EXISTS user_states (
+      user_id TEXT NOT NULL,
+      state_key TEXT NOT NULL,
+      state_value TEXT,
+      expiry_time INTEGER,
+      PRIMARY KEY (user_id, state_key)
+    )`,
+    `CREATE TABLE IF NOT EXISTS blocked_users (
+      user_id TEXT PRIMARY KEY,
+      blocked INTEGER DEFAULT 1,
+      blocked_at INTEGER
+    )`,
+    `CREATE TABLE IF NOT EXISTS message_rates (
+      user_id TEXT PRIMARY KEY,
+      last_message_time INTEGER
+    )`,
+    // 创建索引
+    'CREATE INDEX IF NOT EXISTS idx_users_thread ON users(message_thread_id)',
+    'CREATE INDEX IF NOT EXISTS idx_mappings_key ON message_mappings(mapping_key)',
+    'CREATE INDEX IF NOT EXISTS idx_states_expiry ON user_states(expiry_time)'
+  ]
   
-  if (url.pathname === WEBHOOK) {
-    event.respondWith(handleWebhook(event))
-  } else if (url.pathname === '/registerWebhook') {
-    event.respondWith(registerWebhook(event, url, WEBHOOK, SECRET))
-  } else if (url.pathname === '/unRegisterWebhook') {
-    event.respondWith(unRegisterWebhook(event))
-  } else {
-    event.respondWith(new Response('No handler for this request'))
+  try {
+    // 使用 batch 批量执行所有语句
+    const preparedStatements = statements.map(sql => d1.prepare(sql))
+    await d1.batch(preparedStatements)
+    console.log('✅ Database tables initialized successfully')
+  } catch (error) {
+    console.error('❌ Database initialization error:', error)
+    throw error
   }
-})
+}
+
+/**
+ * 主事件监听器 (使用 ES Module 格式)
+ */
+export default {
+  async fetch(request, env, ctx) {
+    // 初始化配置变量
+    initConfig(env)
+    
+    // 初始化数据库连接
+    if (!db && env.D1) {
+      db = new Database(env.D1)
+    }
+    
+    const url = new URL(request.url)
+    
+    if (url.pathname === WEBHOOK) {
+      return await handleWebhook({ request, waitUntil: ctx.waitUntil.bind(ctx) })
+    } else if (url.pathname === '/registerWebhook') {
+      return await registerWebhook({ request }, url, WEBHOOK, SECRET)
+    } else if (url.pathname === '/unRegisterWebhook') {
+      return await unRegisterWebhook({ request })
+    } else if (url.pathname === '/initDatabase') {
+      try {
+        await initDatabase(env.D1)
+        return new Response('✅ Database initialized successfully', { 
+          status: 200,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        })
+      } catch (error) {
+        return new Response(`❌ Database initialization failed: ${error.message}`, { 
+          status: 500,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        })
+      }
+    } else {
+      return new Response('No handler for this request')
+    }
+  }
+}
